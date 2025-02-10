@@ -6,6 +6,7 @@ import base58
 import hashlib
 import websockets
 import time
+import logging
 
 from solana.rpc.async_api import AsyncClient
 from solana.transaction import Transaction
@@ -24,6 +25,14 @@ import spl.token.instructions as spl_token
 from config import *
 
 from construct import Struct, Int64ul, Flag
+
+# Configure logging
+logging.basicConfig(
+    filename='trader.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # Here and later all the discriminators are precalculated. See learning-examples/discriminator.py
 EXPECTED_DISCRIMINATOR = struct.pack("<Q", 6966180631402821399)
@@ -60,7 +69,7 @@ def calculate_pump_curve_price(curve_state: BondingCurveState) -> float:
 
     return (curve_state.virtual_sol_reserves / LAMPORTS_PER_SOL) / (curve_state.virtual_token_reserves / 10 ** TOKEN_DECIMALS)
 
-async def buy_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curve: Pubkey, amount: float, slippage: float = 0.01, max_retries=5):
+async def buy_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curve: Pubkey, amount: float, slippage: float, max_retries=MAX_RETRIES):
     private_key = base58.b58decode(PRIVATE_KEY)
     payer = Keypair.from_bytes(private_key)
 
@@ -81,7 +90,7 @@ async def buy_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curv
             try:
                 account_info = await client.get_account_info(associated_token_account)
                 if account_info.value is None:
-                    print(f"Creating associated token account (Attempt {ata_attempt + 1})...")
+                    logging.info(f"Creating associated token account (Attempt {ata_attempt + 1})...")
                     create_ata_ix = spl_token.create_associated_token_account(
                         payer=payer.pubkey(),
                         owner=payer.pubkey(),
@@ -92,21 +101,21 @@ async def buy_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curv
                     recent_blockhash = await client.get_latest_blockhash()
                     create_ata_tx.recent_blockhash = recent_blockhash.value.blockhash
                     await client.send_transaction(create_ata_tx, payer)
-                    print("Associated token account created.")
-                    print(f"Associated token account address: {associated_token_account}")
+                    logging.info("Associated token account created.")
+                    logging.info(f"Associated token account address: {associated_token_account}")
                     break
                 else:
-                    print("Associated token account already exists.")
-                    print(f"Associated token account address: {associated_token_account}")
+                    logging.info("Associated token account already exists.")
+                    logging.info(f"Associated token account address: {associated_token_account}")
                     break
             except Exception as e:
-                print(f"Attempt {ata_attempt + 1} to create associated token account failed: {str(e)}")
+                logging.error(f"Attempt {ata_attempt + 1} to create associated token account failed: {str(e)}")
                 if ata_attempt < max_retries - 1:
                     wait_time = 2 ** ata_attempt
-                    print(f"Retrying in {wait_time} seconds...")
+                    logging.info(f"Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
                 else:
-                    print("Max retries reached. Unable to create associated token account.")
+                    logging.error("Max retries reached. Unable to create associated token account.")
                     return
 
         # Continue with the buy transaction
@@ -142,20 +151,26 @@ async def buy_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curv
                     opts=TxOpts(skip_preflight=True, preflight_commitment=Confirmed),
                 )
 
-                print(f"Transaction sent: https://explorer.solana.com/tx/{tx.value}")
+                logging.info(f"Transaction sent: https://explorer.solana.com/tx/{tx.value}")
 
                 await client.confirm_transaction(tx.value, commitment="confirmed")
-                print("Transaction confirmed")
+                logging.info("Transaction confirmed")
+
+                # Implement Jito tips if enabled
+                if JITO_TIPS_ENABLED:
+                    # Add logic to include Jito tips in the transaction
+                    pass
+
                 return tx.value
 
             except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {str(e)}")
+                logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
-                    print(f"Retrying in {wait_time} seconds...")
+                    logging.info(f"Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
                 else:
-                    print("Max retries reached. Unable to complete the transaction.")
+                    logging.error("Max retries reached. Unable to complete the transaction.")
 
 def load_idl(file_path):
     with open(file_path, 'r') as f:

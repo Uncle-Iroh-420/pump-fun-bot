@@ -4,6 +4,7 @@ import base64
 import struct
 import base58
 from typing import Final
+import logging
 
 from solana.rpc.async_api import AsyncClient
 from solana.transaction import Transaction
@@ -21,6 +22,14 @@ import spl.token.instructions as spl_token
 from construct import Struct, Int64ul, Flag
 
 from config import *
+
+# Configure logging
+logging.basicConfig(
+    filename='trader.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # Here and later all the discriminators are precalculated. See learning-examples/discriminator.py
 EXPECTED_DISCRIMINATOR: Final[bytes] = struct.pack("<Q", 6966180631402821399)
@@ -63,7 +72,7 @@ async def get_token_balance(conn: AsyncClient, associated_token_account: Pubkey)
         return int(response.value.amount)
     return 0
 
-async def sell_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curve: Pubkey, slippage: float = 0.25, max_retries=5):
+async def sell_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_curve: Pubkey, slippage: float, max_retries=MAX_RETRIES):
     private_key = base58.b58decode(PRIVATE_KEY)
     payer = Keypair.from_bytes(private_key)
 
@@ -73,15 +82,15 @@ async def sell_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_cur
         # Get token balance
         token_balance = await get_token_balance(client, associated_token_account)
         token_balance_decimal = token_balance / 10**TOKEN_DECIMALS
-        print(f"Token balance: {token_balance_decimal}")
+        logging.info(f"Token balance: {token_balance_decimal}")
         if token_balance == 0:
-            print("No tokens to sell.")
+            logging.warning("No tokens to sell.")
             return
 
         # Fetch the token price
         curve_state = await get_pump_curve_state(client, bonding_curve)
         token_price_sol = calculate_pump_curve_price(curve_state)
-        print(f"Price per Token: {token_price_sol:.20f} SOL")
+        logging.info(f"Price per Token: {token_price_sol:.20f} SOL")
 
         # Calculate minimum SOL output
         amount = token_balance
@@ -89,8 +98,13 @@ async def sell_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_cur
         slippage_factor = 1 - slippage
         min_sol_output = int((min_sol_output * slippage_factor) * LAMPORTS_PER_SOL)
         
-        print(f"Selling {token_balance_decimal} tokens")
-        print(f"Minimum SOL output: {min_sol_output / LAMPORTS_PER_SOL:.10f} SOL")
+        logging.info(f"Selling {token_balance_decimal} tokens")
+        logging.info(f"Minimum SOL output: {min_sol_output / LAMPORTS_PER_SOL:.10f} SOL")
+
+        # Implement auto-sell logic
+        if AUTO_SELL:
+            # Add logic to automatically sell based on TAKE_PROFIT and STOP_LOSS
+            pass
 
         for attempt in range(max_retries):
             try:
@@ -124,18 +138,18 @@ async def sell_token(mint: Pubkey, bonding_curve: Pubkey, associated_bonding_cur
                     opts=TxOpts(skip_preflight=True, preflight_commitment=Confirmed),
                 )
 
-                print(f"Transaction sent: https://explorer.solana.com/tx/{tx.value}")
+                logging.info(f"Transaction sent: https://explorer.solana.com/tx/{tx.value}")
 
                 await client.confirm_transaction(tx.value, commitment="confirmed")
-                print("Transaction confirmed")
+                logging.info("Transaction confirmed")
 
                 return tx.value
 
             except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {str(e)}")
+                logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
-                    print(f"Retrying in {wait_time} seconds...")
+                    logging.info(f"Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
                 else:
-                    print("Max retries reached. Unable to complete the transaction.")
+                    logging.error("Max retries reached. Unable to complete the transaction.")

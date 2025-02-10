@@ -8,6 +8,7 @@ import websockets
 import os
 import argparse
 from datetime import datetime
+import logging
 
 from solana.rpc.async_api import AsyncClient
 from solana.transaction import Transaction
@@ -31,6 +32,14 @@ from buy import get_pump_curve_state, calculate_pump_curve_price, buy_token, lis
 # Import functions from sell.py
 from sell import sell_token
 
+# Configure logging
+logging.basicConfig(
+    filename='trader.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
 def log_trade(action, token_data, price, tx_hash):
     os.makedirs("trades", exist_ok=True)
     log_entry = {
@@ -53,67 +62,55 @@ async def trade(websocket=None, match_string=None, bro_address=None, marry_mode=
 
 async def _trade(websocket, match_string=None, bro_address=None, marry_mode=False, yolo_mode=False):
     while True:
-        print("Waiting for a new token creation...")
-        token_data = await listen_for_create_transaction(websocket)
-        print("New token created:")
-        print(json.dumps(token_data, indent=2))
+        try:
+            logging.info("Waiting for a new token creation...")
+            token_data = await listen_for_create_transaction(websocket)
+            logging.info(f"New token created: {token_data['name']}")
 
-        if match_string and not (match_string.lower() in token_data['name'].lower() or match_string.lower() in token_data['symbol'].lower()):
-            print(f"Token does not match the criteria '{match_string}'. Skipping...")
-            if not yolo_mode:
-                break
-            continue
+            # Apply token filters
+            if not filter_tokens(token_data):
+                logging.info("Token does not meet filter criteria. Skipping...")
+                continue
 
-        if bro_address and token_data['user'] != bro_address:
-            print(f"Token not created by the specified user '{bro_address}'. Skipping...")
-            if not yolo_mode:
-                break
-            continue
+            # Determine strategy based on pool size
+            pool_size = token_data.get("pool_size", 0)
+            strategy, params = get_strategy_parameters(pool_size)
+            logging.info(f"Selected Strategy: {strategy}")
 
-        # Save token information to a .txt file in the "trades" directory
-        mint_address = token_data['mint']
-        os.makedirs("trades", exist_ok=True)
-        file_name = os.path.join("trades", f"{mint_address}.txt")
-        with open(file_name, 'w') as file:
-            file.write(json.dumps(token_data, indent=2))
-        print(f"Token information saved to {file_name}")
+            # Use strategy parameters for trading
+            buy_amount = params["buying_amount_wsol"]
+            buy_slippage = params["buy_slippage"]
+            sell_slippage = params["sell_slippage"]
+            take_profit = params["take_profit"]
+            stop_loss = params["stop_loss"]
+            enforced_selling_time = params["enforced_selling_time_ms"] / 1000.0
 
-        print("Waiting for 15 seconds for things to stabilize...")
-        await asyncio.sleep(15)
-
-        mint = Pubkey.from_string(token_data['mint'])
-        bonding_curve = Pubkey.from_string(token_data['bondingCurve'])
-        associated_bonding_curve = Pubkey.from_string(token_data['associatedBondingCurve'])
-
-        # Fetch the token price
-        async with AsyncClient(RPC_ENDPOINT) as client:
-            curve_state = await get_pump_curve_state(client, bonding_curve)
-            token_price_sol = calculate_pump_curve_price(curve_state)
-
-        print(f"Bonding curve address: {bonding_curve}")
-        print(f"Token price: {token_price_sol:.10f} SOL")
-        print(f"Buying {BUY_AMOUNT:.6f} SOL worth of the new token with {BUY_SLIPPAGE*100:.1f}% slippage tolerance...")
-        buy_tx_hash = await buy_token(mint, bonding_curve, associated_bonding_curve, BUY_AMOUNT, BUY_SLIPPAGE)
-        if buy_tx_hash:
-            log_trade("buy", token_data, token_price_sol, str(buy_tx_hash))
-        else:
-            print("Buy transaction failed.")
-
-        if not marry_mode:
-            print("Waiting for 20 seconds before selling...")
-            await asyncio.sleep(20)
-
-            print(f"Selling tokens with {SELL_SLIPPAGE*100:.1f}% slippage tolerance...")
-            sell_tx_hash = await sell_token(mint, bonding_curve, associated_bonding_curve, SELL_SLIPPAGE)
-            if sell_tx_hash:
-                log_trade("sell", token_data, token_price_sol, str(sell_tx_hash))
+            # Proceed with trading logic using the strategy parameters
+            logging.info(f"Buying {buy_amount:.6f} WSOL worth of the new token with {buy_slippage*100:.1f}% slippage tolerance...")
+            buy_tx_hash = await buy_token(mint, bonding_curve, associated_bonding_curve, amount=buy_amount, slippage=buy_slippage)
+            if buy_tx_hash:
+                logging.info(f"Buy transaction successful: {buy_tx_hash}")
             else:
-                print("Sell transaction failed or no tokens to sell.")
-        else:
-            print("Marry mode enabled. Skipping sell operation.")
+                logging.warning("Buy transaction failed.")
 
-        if not yolo_mode:
-            break
+            if not marry_mode:
+                logging.info(f"Waiting for {enforced_selling_time} seconds before selling...")
+                await asyncio.sleep(enforced_selling_time)
+
+                logging.info(f"Selling tokens with {sell_slippage*100:.1f}% slippage tolerance...")
+                sell_tx_hash = await sell_token(mint, bonding_curve, associated_bonding_curve, slippage=sell_slippage)
+                if sell_tx_hash:
+                    logging.info(f"Sell transaction successful: {sell_tx_hash}")
+                else:
+                    logging.warning("Sell transaction failed or no tokens to sell.")
+            else:
+                logging.info("Marry mode enabled. Skipping sell operation.")
+
+            if not yolo_mode:
+                break
+
+        except Exception as e:
+            logging.error(f"An error occurred: {str(e)}")
 
 async def main(yolo_mode=False, match_string=None, bro_address=None, marry_mode=False):
     if yolo_mode:
@@ -146,6 +143,44 @@ async def ping_websocket(websocket):
             await asyncio.sleep(20) # Send a ping every 20 seconds
         except:
             break
+
+def filter_tokens(token_data):
+    if FILTERS["check_freezable"] and token_data.get("is_freezable"):
+        return False
+    if FILTERS["check_lp_burned"] and token_data.get("lp_burned"):
+        return False
+    if FILTERS["skip_lp_bundles"] and token_data.get("is_lp_bundle"):
+        return False
+    if token_data.get("pool_size", 0) < FILTERS["min_pool_size"]:
+        return False
+    if token_data.get("dev_hold", 0) > FILTERS["max_dev_hold"]:
+        return False
+    return True
+
+def get_strategy_parameters(pool_size):
+    if pool_size < 100:
+        strategy = "small_pool"
+        params = {
+            "buying_amount_wsol": 0.2,
+            "take_profit": 0.10,
+            "stop_loss": 0.08,
+            "enforced_selling_time_ms": 60000,
+            "buy_slippage": 0.40,
+            "sell_slippage": 0.40,
+            "price_check_interval_ms": 500
+        }
+    else:
+        strategy = "large_pool"
+        params = {
+            "buying_amount_wsol": 0.5,
+            "take_profit": 0.17,
+            "stop_loss": 0.10,
+            "enforced_selling_time_ms": 150000,
+            "buy_slippage": 0.40,
+            "sell_slippage": 0.40,
+            "price_check_interval_ms": 500
+        }
+    return strategy, params
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trade tokens on Solana.")
